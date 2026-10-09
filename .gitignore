@@ -1,6 +1,7 @@
 venv/
 .venv/
 .env
+.reminder-state.json
 __pycache__/
 *.pyc
 .vscode/

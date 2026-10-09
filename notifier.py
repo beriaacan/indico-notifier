@@ -1,6 +1,7 @@
 """Collect upcoming CERN Indico events and post a digest."""
 
 import html
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ REQUEST_TIMEOUT = 20
 TELEGRAM_MESSAGE_LIMIT = 4000
 ZURICH = ZoneInfo("Europe/Zurich")
 WINDOW_DAYS = 7
+REMINDER_LEAD_MINUTES = 15
 
 # Live public categories on indico.cern.ch for the named series.
 # 2 is "TEST Category"; 3180, 3182 and 3183 currently return no events.
@@ -1056,6 +1058,96 @@ def deliver(events: list[dict], errors: list[str]) -> None:
         print("Webhook notification sent.", file=sys.stderr)
 
 
+def zurich_now() -> datetime:
+    return datetime.now(ZURICH).replace(tzinfo=None)
+
+
+def reminder_state_path() -> Path:
+    return Path(__file__).resolve().parent / ".reminder-state.json"
+
+
+def reminder_key(event: dict) -> str:
+    return f"{event['id']}\t{event['start'].isoformat(timespec='minutes')}"
+
+
+def load_sent_reminders() -> set[str]:
+    path = reminder_state_path()
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {item for item in data if isinstance(item, str)}
+
+
+def save_sent_reminders(keys: set[str], now: datetime) -> None:
+    cutoff = now - timedelta(days=2)
+    kept: set[str] = set()
+    for key in keys:
+        stamp = key.rpartition("\t")[2]
+        try:
+            start = datetime.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if start >= cutoff:
+            kept.add(key)
+    reminder_state_path().write_text(json.dumps(sorted(kept), indent=2) + "\n")
+
+
+def meetings_due(events: list[dict], now: datetime, sent: set[str]) -> list[dict]:
+    due: list[dict] = []
+    for event in events:
+        if not is_personal(event) or hidden_on_telegram(event):
+            continue
+        minutes = (event["start"] - now).total_seconds() / 60
+        if -5 <= minutes <= REMINDER_LEAD_MINUTES and reminder_key(event) not in sent:
+            due.append(event)
+    due.sort(key=lambda event: (event["start"], event["title"].lower()))
+    return due
+
+
+def build_reminder_message(event: dict, now: datetime) -> str:
+    minutes = max(0, int((event["start"] - now).total_seconds() // 60))
+    lead = "Starting now" if minutes <= 1 else f"Starting in {minutes} min"
+    url = html.escape(event["url"], quote=True)
+    return "\n".join(
+        [
+            f"⏰ <b>{lead}</b>",
+            f"🕐 <b>{html.escape(format_when(event))}</b>",
+            f"<b>{html.escape(event['title'])}</b>",
+            f"🏷 {html.escape(display_label(event))}",
+            f"📍 {html.escape(friendly_place(event['place']))}",
+            f'🔗 <a href="{url}">Open in Indico</a>',
+        ]
+    )
+
+
+def remind() -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("Set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.", file=sys.stderr)
+        sys.exit(1)
+
+    now = zurich_now()
+    events, _errors = assemble_digest()
+    sent = load_sent_reminders()
+    due = meetings_due(events, now, sent)
+    if not due:
+        save_sent_reminders(sent, now)
+        print("No For you meetings starting soon.")
+        return
+
+    for event in due:
+        send_telegram([build_reminder_message(event, now)], token, chat_id)
+        sent.add(reminder_key(event))
+        print(f"Reminded: {event['title']}", file=sys.stderr)
+    save_sent_reminders(sent, now)
+
+
 def main() -> None:
     events, errors = assemble_digest()
     deliver(events, errors)
@@ -1065,5 +1157,7 @@ if __name__ == "__main__":
     load_dotenv(Path(__file__).resolve().parent / ".env")
     if "--chat-id" in sys.argv:
         print_chat_ids()
+    elif "--remind" in sys.argv:
+        remind()
     else:
         main()

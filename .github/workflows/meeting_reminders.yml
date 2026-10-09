@@ -1,0 +1,47 @@
+name: Meeting reminders
+
+on:
+  schedule:
+    # Every 15 minutes on weekdays, 05:00–18:00 UTC.
+    # That covers CERN working hours in both winter and summer time.
+    - cron: "*/15 5-18 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore reminder state
+        uses: actions/cache/restore@v4
+        with:
+          path: .reminder-state.json
+          key: reminder-state-${{ github.run_id }}
+          restore-keys: reminder-state-
+
+      - name: Send due reminders
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INDICO_API_TOKEN: ${{ secrets.INDICO_API_TOKEN }}
+        run: python notifier.py --remind
+
+      - name: Save reminder state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .reminder-state.json
+          key: reminder-state-${{ github.run_id }}

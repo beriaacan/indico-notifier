@@ -24,6 +24,8 @@ Star an event or category on Indico to add it to your agenda. The next run picks
 
 Titles in `TELEGRAM_SKIP_TITLES` inside `notifier.py` are left out of the Telegram text. They still appear in the PDF and in the Mattermost message.
 
+`python notifier.py --remind` sends one short Telegram message for each remaining For you meeting that starts within 15 minutes. `.github/workflows/meeting_reminders.yml` runs that check every 15 minutes on weekdays.
+
 ## Run
 
 ```bash
