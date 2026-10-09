@@ -22,6 +22,8 @@ Fill in `.env`:
 
 Star an event or category on Indico to add it to your agenda. The next run picks up the next 7 days.
 
+Titles in `TELEGRAM_SKIP_TITLES` inside `notifier.py` are left out of the Telegram text. They still appear in the PDF and in the Mattermost message.
+
 ## Run
 
 ```bash

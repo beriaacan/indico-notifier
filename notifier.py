@@ -607,8 +607,28 @@ def telegram_section(emoji: str, title: str, events: list[dict], empty_text: str
     return blocks
 
 
+# Omitted from the Telegram text only. The PDF and the Mattermost digest still include them.
+TELEGRAM_SKIP_TITLES = (
+    "CERN CAF - plan of the day",
+    "Cassette Integration - remaining open issues",
+    "TPG Stage 1",
+    "HGCAL DQM working meeting",
+    "Electronics simulation meeting",
+    "Online Software Coordination",
+    "MAC module testing QC Meeting",
+    "Tileboard QC Technical Meeting",
+    "Production Coordination Meeting - CM, Engines, Wagons",
+)
+
+
+def hidden_on_telegram(event: dict) -> bool:
+    title = event["title"].casefold().strip()
+    return any(title.startswith(skip.casefold()) for skip in TELEGRAM_SKIP_TITLES)
+
+
 def build_telegram_messages(events: list[dict], errors: list[str]) -> list[str]:
-    personal, public = split_for_reader(events)
+    visible = [event for event in events if not hidden_on_telegram(event)]
+    personal, public = split_for_reader(visible)
     header = f"📅 <b>Next 7 days</b>\n<i>{html.escape(format_span())}</i>"
     blocks = telegram_section(
         "⭐",
