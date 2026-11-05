@@ -32,6 +32,14 @@ jobs:
           key: reminder-state-${{ github.run_id }}
           restore-keys: reminder-state-
 
+      - name: Write the PI list
+        env:
+          PI_LIST: ${{ secrets.PI_LIST }}
+        run: |
+          if [ -n "$PI_LIST" ]; then
+            printf '%s\n' "$PI_LIST" > PI_list.csv
+          fi
+
       - name: Send due reminders
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

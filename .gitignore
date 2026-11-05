@@ -2,6 +2,8 @@ venv/
 .venv/
 .env
 .reminder-state.json
+PI_list.txt
+PI_list.csv
 __pycache__/
 *.pyc
 .vscode/

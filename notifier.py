@@ -1,8 +1,10 @@
 """Collect upcoming CERN Indico events and post a digest."""
 
+import csv
 import html
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,14 +34,42 @@ CATEGORIES = {
     84: "Detector Seminars",
 }
 
+# Protected CMS categories. The export is empty unless the Indico token is sent.
+# 12412 is the Machine Learning Group. 12537 holds the working-group meetings
+# (ML4RECO, MLPF). 1309 is the BTV b-tagging POG. There is no separate
+# "AI for Simulation" category; those talks are filed under 12412 and 12537.
+ML_CATEGORIES = {
+    12412: "CMS Machine Learning Group",
+    12537: "CMS ML Working Groups",
+    1309: "CMS BTV b-tagging",
+}
 
-def fetch_category(cat_id: int) -> list[dict]:
+# Names in PI_list.csv are checked against chairs, speakers, and agenda text.
+# A match is shown first. Every meeting in ML_CATEGORIES is still included.
+PI_LIST = Path(__file__).resolve().parent / "PI_list.csv"
+GIVEN_NAMES = {
+    "matt": "matthew",
+    "joe": "joseph",
+    "greg": "gregory",
+    "tim": "timothy",
+    "mike": "michael",
+    "alex": "alexander",
+}
+
+
+def fetch_category(cat_id: int, token: str = "", detail: str = "") -> list[dict]:
     """Return raw event dicts for one category. Raises on HTTP or JSON failure."""
+    headers = {"User-Agent": "indico-notifier"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    params = {"from": "today", "to": f"+{WINDOW_DAYS}d"}
+    if detail:
+        params["detail"] = detail
     response = requests.get(
         INDICO_EXPORT.format(cat_id=cat_id),
-        params={"from": "today", "to": f"+{WINDOW_DAYS}d"},
+        params=params,
         timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": "indico-notifier"},
+        headers=headers,
     )
     response.raise_for_status()
     payload = response.json()
@@ -117,7 +147,7 @@ def collect_events() -> tuple[list[dict], list[str]]:
 
     for cat_id, name in CATEGORIES.items():
         try:
-            raw_events = fetch_category(cat_id)
+            raw_events = fetch_category(cat_id, detail="contributions")
         except requests.Timeout:
             errors.append(f"{name} ({cat_id}): request timed out")
             continue
@@ -132,6 +162,207 @@ def collect_events() -> tuple[list[dict], list[str]]:
             event = parse_event(raw, name)
             if event is None or event["id"] in seen:
                 continue
+            attach_people(event, raw)
+            seen.add(event["id"])
+            events.append(event)
+
+    events.sort(key=lambda event: (event["start"], event["title"].lower()))
+    return events, errors
+
+
+def fold_text(value: str) -> str:
+    table = str.maketrans(
+        {
+            "ö": "o",
+            "Ö": "o",
+            "ü": "u",
+            "Ü": "u",
+            "ş": "s",
+            "Ş": "s",
+            "ğ": "g",
+            "Ğ": "g",
+            "ı": "i",
+            "İ": "i",
+            "ç": "c",
+            "Ç": "c",
+            "â": "a",
+            "ê": "e",
+            "î": "i",
+            "ô": "o",
+            "û": "u",
+        }
+    )
+    return value.casefold().translate(table)
+
+
+def person_names(people: object) -> list[str]:
+    names: list[str] = []
+    if not isinstance(people, list):
+        return names
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        name = str(person.get("fullName") or person.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def name_tokens(value: str) -> list[str]:
+    skip = {"prof", "dr", "mr", "ms", "mrs"}
+    return [token for token in re.split(r"[^a-z0-9]+", fold_text(value)) if token and token not in skip]
+
+
+def token_forms(token: str) -> set[str]:
+    forms = {token}
+    longer = GIVEN_NAMES.get(token)
+    if longer:
+        forms.add(longer)
+    for short, long in GIVEN_NAMES.items():
+        if token == long:
+            forms.add(short)
+    for source, target in (("u", "ue"), ("o", "oe"), ("a", "ae")):
+        if source in token:
+            forms.add(token.replace(source, target))
+        if target in token:
+            forms.add(token.replace(target, source))
+    return forms
+
+
+def tokens_match(pi_tokens: list[str], person_tokens: list[str]) -> bool:
+    if len(pi_tokens) < 2 or not person_tokens:
+        return False
+    if not any(form in person_tokens for form in token_forms(pi_tokens[-1])):
+        return False
+    for given in pi_tokens[:-1]:
+        forms = token_forms(given)
+        if any(form in person_tokens for form in forms):
+            return True
+        if any(
+            len(form) >= 4 and any(person.startswith(form) for person in person_tokens)
+            for form in forms
+        ):
+            return True
+    return False
+
+
+def text_has_pi(text: str, pi_tokens: list[str]) -> bool:
+    folded = fold_text(text)
+    last_forms = token_forms(pi_tokens[-1])
+    given_forms: set[str] = set()
+    for given in pi_tokens[:-1]:
+        given_forms.update(token_forms(given))
+    for match in re.finditer(r"[a-z0-9]+", folded):
+        if match.group() not in last_forms:
+            continue
+        window = folded[max(0, match.start() - 40) : match.end() + 40]
+        if any(re.search(rf"\b{re.escape(form)}\b", window) for form in given_forms):
+            return True
+    return False
+
+
+def load_pis() -> list[tuple[list[str], str]]:
+    if not PI_LIST.is_file():
+        return []
+    found: list[tuple[list[str], str]] = []
+    seen: set[tuple[str, ...]] = set()
+    with PI_LIST.open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            name = str((row or {}).get("name") or "").strip()
+            tokens = name_tokens(name)
+            if len(tokens) < 2:
+                continue
+            key = tuple(tokens)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((tokens, name))
+    return found
+
+
+def matching_pis(people: list[str], text: str) -> list[str]:
+    matched: list[str] = []
+    person_token_sets = [name_tokens(person) for person in people]
+    for pi_tokens, label in load_pis():
+        in_people = any(tokens_match(pi_tokens, person) for person in person_token_sets)
+        if in_people or text_has_pi(text, pi_tokens):
+            matched.append(label)
+    return matched
+
+
+def chair_line(chairs: list[str]) -> str:
+    text = ", ".join(chairs[:4])
+    if len(chairs) > 4:
+        text += f" +{len(chairs) - 4}"
+    return text
+
+
+def people_note(raw: dict) -> tuple[str, list[str]]:
+    """Chair line, with PI_list.csv names called out first."""
+    chairs = person_names(raw.get("chairs"))
+    speakers: list[str] = []
+    agenda_parts = [str(raw.get("title") or ""), str(raw.get("description") or "")]
+    for contrib in raw.get("contributions") or []:
+        if not isinstance(contrib, dict):
+            continue
+        agenda_parts.append(str(contrib.get("title") or ""))
+        agenda_parts.append(str(contrib.get("description") or ""))
+        for name in person_names(contrib.get("speakers")):
+            if name not in chairs and name not in speakers:
+                speakers.append(name)
+
+    pis = matching_pis(chairs + speakers, "\n".join(agenda_parts))
+    parts: list[str] = []
+    if pis:
+        parts.append("PI: " + ", ".join(pis))
+    others = [
+        chair
+        for chair in chairs
+        if not any(tokens_match(name_tokens(pi), name_tokens(chair)) for pi in pis)
+    ]
+    shown = others if pis else chairs
+    if shown:
+        parts.append(chair_line(shown))
+    return " · ".join(parts), pis
+
+
+def attach_people(event: dict, raw: dict) -> None:
+    note, pis = people_note(raw)
+    if note:
+        event["note"] = note
+    if pis:
+        event["pi"] = pis
+
+
+def collect_ml_events(token: str) -> tuple[list[dict], list[str]]:
+    if not token:
+        return [], ["CMS Machine Learning categories need INDICO_API_TOKEN"]
+
+    events: list[dict] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for cat_id, name in ML_CATEGORIES.items():
+        try:
+            raw_events = fetch_category(cat_id, token=token, detail="contributions")
+        except requests.Timeout:
+            errors.append(f"{name} ({cat_id}): request timed out")
+            continue
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            errors.append(f"{name} ({cat_id}): Indico returned HTTP {status}")
+            continue
+        except requests.RequestException:
+            errors.append(f"{name} ({cat_id}): request failed")
+            continue
+        except ValueError as exc:
+            errors.append(f"{name} ({cat_id}): {exc}")
+            continue
+
+        for raw in raw_events:
+            event = parse_event(raw, name)
+            if event is None or event["id"] in seen:
+                continue
+            attach_people(event, raw)
             seen.add(event["id"])
             events.append(event)
 
@@ -249,7 +480,7 @@ def ics_event(fields: dict[str, str]) -> dict | None:
     end_parsed = parse_ics_datetime(fields.get("DTEND", ""))
     end = end_parsed[0] if end_parsed and end_parsed[0] > start else None
     url = fields.get("URL") or INDICO_BASE + "/"
-    return {
+    event = {
         "id": fields.get("UID") or url or title,
         "title": title,
         "start": start,
@@ -259,6 +490,12 @@ def ics_event(fields: dict[str, str]) -> dict | None:
         "url": url,
         "category": "Your agenda",
     }
+    blob = "\n".join(fields.get(key, "") for key in ("SUMMARY", "DESCRIPTION", "ORGANIZER"))
+    pis = [label for tokens, label in load_pis() if text_has_pi(blob, tokens)]
+    if pis:
+        event["pi"] = pis
+        event["note"] = "PI: " + ", ".join(pis)
+    return event
 
 
 def slot_end(raw: dict, start: datetime) -> datetime | None:
@@ -435,6 +672,10 @@ def merge_items(personal: list[dict], bookings: list[dict], seminars: list[dict]
         if existing is not None:
             if seminar["category"] not in existing["category"]:
                 existing["category"] = f"{existing['category']} · {seminar['category']}"
+            if seminar.get("pi"):
+                existing["pi"] = seminar["pi"]
+            if seminar.get("note") and (seminar.get("pi") or not existing.get("note")):
+                existing["note"] = seminar["note"]
             continue
         merged.append(seminar)
     merged.sort(key=lambda event: (event["start"], event["title"].lower()))
@@ -451,7 +692,9 @@ def assemble_digest() -> tuple[list[dict], list[str]]:
         errors.extend(account_errors)
     seminars, seminar_errors = collect_events()
     errors.extend(seminar_errors)
-    return merge_items(personal, bookings, seminars), errors
+    machine_learning, ml_errors = collect_ml_events(token)
+    errors.extend(ml_errors)
+    return merge_items(personal, bookings, seminars + machine_learning), errors
 
 
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -471,7 +714,14 @@ MONTHS = (
 )
 
 
+def is_ml(event: dict) -> bool:
+    category = event["category"]
+    return any(label in category for label in ML_CATEGORIES.values())
+
+
 def is_personal(event: dict) -> bool:
+    if is_ml(event):
+        return False
     category = event["category"]
     return category.startswith("Your agenda") or category.startswith("Room booking")
 
@@ -517,10 +767,11 @@ def format_span() -> str:
     )
 
 
-def split_for_reader(events: list[dict]) -> tuple[list[dict], list[dict]]:
+def split_for_reader(events: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     personal = [event for event in events if is_personal(event)]
-    public = [event for event in events if not is_personal(event)]
-    return personal, public
+    machine_learning = [event for event in events if is_ml(event)]
+    public = [event for event in events if not is_personal(event) and not is_ml(event)]
+    return personal, machine_learning, public
 
 
 def count_label(events: list[dict]) -> str:
@@ -553,11 +804,34 @@ def markdown_meta(event: dict) -> str:
     place = friendly_place(event["place"])
     if place != "Place not announced":
         bits.append(markdown_text(place))
+    note = str(event.get("note") or "").strip()
+    if note:
+        bits.append(markdown_text(note))
     bits.append(f"[Indico]({event['url']})")
     return " · ".join(bits)
 
 
+def ordered_for_display(events: list[dict]) -> list[dict]:
+    return sorted(
+        events,
+        key=lambda event: (
+            event["start"].date(),
+            0 if event.get("pi") else 1,
+            event["start"],
+            event["title"].lower(),
+        ),
+    )
+
+
+def pi_events(events: list[dict]) -> list[dict]:
+    return sorted(
+        (event for event in events if event.get("pi")),
+        key=lambda event: (event["start"], event["title"].lower()),
+    )
+
+
 def markdown_section(title: str, events: list[dict], empty_text: str) -> list[str]:
+    events = ordered_for_display(events)
     if not events:
         return [f"**{title}** · {empty_text}", ""]
     lines = [f"**{title}** · {count_label(events)}", ""]
@@ -575,9 +849,27 @@ def markdown_section(title: str, events: list[dict], empty_text: str) -> list[st
 
 
 def build_markdown(events: list[dict], errors: list[str]) -> str:
-    personal, public = split_for_reader(events)
+    personal, machine_learning, public = split_for_reader(events)
     lines = [f"**Next 7 days** · {format_span()}", ""]
+    featured = pi_events(events)
+    if featured:
+        lines.append(f"**PI this week** · {count_label(featured)}")
+        lines.append("")
+        for event in featured:
+            names = ", ".join(event.get("pi") or [])
+            lines.append(
+                f"- **{format_when(event)}** {markdown_text(event['title'])} — {markdown_text(names)}"
+            )
+        lines.extend(["", "---", ""])
     lines.extend(markdown_section("For you", personal, "Nothing on your agenda in the next 7 days."))
+    lines.extend(["---", ""])
+    lines.extend(
+        markdown_section(
+            "CMS Machine Learning",
+            machine_learning,
+            "No CMS Machine Learning meetings in the next 7 days.",
+        )
+    )
     lines.extend(["---", ""])
     lines.extend(markdown_section("General seminars", public, "No public seminars in the next 7 days."))
     if errors:
@@ -589,18 +881,22 @@ def build_markdown(events: list[dict], errors: list[str]) -> str:
 
 def event_html(event: dict) -> str:
     url = html.escape(event["url"], quote=True)
-    return "\n".join(
-        [
-            f"🕐 <b>{html.escape(format_when(event))}</b>",
-            f"<b>{html.escape(event['title'])}</b>",
-            f"🏷 {html.escape(display_label(event))}",
-            f"📍 {html.escape(friendly_place(event['place']))}",
-            f'🔗 <a href="{url}">Open in Indico</a>',
-        ]
-    )
+    lines = [
+        f"🕐 <b>{html.escape(format_when(event))}</b>",
+        f"<b>{html.escape(event['title'])}</b>",
+        f"🏷 {html.escape(display_label(event))}",
+        f"📍 {html.escape(friendly_place(event['place']))}",
+    ]
+    note = str(event.get("note") or "").strip()
+    if note:
+        icon = "🎯" if note.startswith("PI:") else "👥"
+        lines.append(f"{icon} {html.escape(note)}")
+    lines.append(f'🔗 <a href="{url}">Open in Indico</a>')
+    return "\n".join(lines)
 
 
 def telegram_section(emoji: str, title: str, events: list[dict], empty_text: str) -> list[str]:
+    events = ordered_for_display(events)
     heading = f"{emoji} <b>{title}</b>"
     if not events:
         return [f"{heading}\n{html.escape(empty_text)}"]
@@ -630,13 +926,35 @@ def hidden_on_telegram(event: dict) -> bool:
 
 def build_telegram_messages(events: list[dict], errors: list[str]) -> list[str]:
     visible = [event for event in events if not hidden_on_telegram(event)]
-    personal, public = split_for_reader(visible)
+    personal, machine_learning, public = split_for_reader(visible)
     header = f"📅 <b>Next 7 days</b>\n<i>{html.escape(format_span())}</i>"
-    blocks = telegram_section(
-        "⭐",
-        "For you",
-        personal,
-        "Nothing on your agenda in the next 7 days.",
+    featured = pi_events(visible)
+    blocks: list[str] = []
+    if featured:
+        featured_lines = [f"🎯 <b>PI this week</b>\n<i>{html.escape(count_label(featured))}</i>"]
+        for event in featured:
+            names = html.escape(", ".join(event.get("pi") or []))
+            featured_lines.append(
+                f"• <b>{html.escape(format_when(event))}</b> {html.escape(event['title'])} — {names}"
+            )
+        blocks.append("\n".join(featured_lines))
+        blocks.append("---")
+    blocks.extend(
+        telegram_section(
+            "⭐",
+            "For you",
+            personal,
+            "Nothing on your agenda in the next 7 days.",
+        )
+    )
+    blocks.append("---")
+    blocks.extend(
+        telegram_section(
+            "🤖",
+            "CMS Machine Learning",
+            machine_learning,
+            "No CMS Machine Learning meetings in the next 7 days.",
+        )
     )
     blocks.append("---")
     blocks.extend(
@@ -762,18 +1080,35 @@ def paint_schedule_header(pdf: FPDF, font: str) -> float:
     pdf.set_draw_color(0, 83, 150)
     pdf.rect(PAGE_MARGIN + 36, 28, 4, 4, style="DF")
     pdf.set_xy(PAGE_MARGIN + 42, 27)
-    pdf.cell(50, 6, "General seminars")
+    pdf.cell(40, 6, "General seminars")
+
+    pdf.set_fill_color(220, 240, 226)
+    pdf.set_draw_color(20, 110, 70)
+    pdf.rect(PAGE_MARGIN + 88, 28, 4, 4, style="DF")
+    pdf.set_xy(PAGE_MARGIN + 94, 27)
+    pdf.cell(36, 6, "CMS ML")
     return 38
 
 
+def event_title(event: dict) -> str:
+    title = event["title"]
+    if event.get("pi"):
+        return f"PI · {title}"
+    return title
+
+
+def schedule_colors(event: dict) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    if is_personal(event):
+        return (255, 236, 204), (176, 112, 32)
+    if is_ml(event):
+        return (220, 240, 226), (20, 110, 70)
+    return (222, 234, 246), (0, 83, 150)
+
+
 def paint_event_bar(pdf: FPDF, font: str, item: dict, x: float, y: float, width: float, height: float) -> None:
-    personal = is_personal(item["event"])
-    if personal:
-        pdf.set_fill_color(255, 236, 204)
-        pdf.set_draw_color(176, 112, 32)
-    else:
-        pdf.set_fill_color(222, 234, 246)
-        pdf.set_draw_color(0, 83, 150)
+    fill, edge = schedule_colors(item["event"])
+    pdf.set_fill_color(*fill)
+    pdf.set_draw_color(*edge)
     pdf.set_line_width(0.3)
     pdf.rect(x, y, width, height, style="DF")
 
@@ -790,7 +1125,7 @@ def paint_event_bar(pdf: FPDF, font: str, item: dict, x: float, y: float, width:
         pdf.set_text_color(28, 36, 48)
         pdf.set_font(font, "B", 8)
         pdf.set_xy(x + pad, cursor)
-        pdf.cell(inner, 3.6, truncate(pdf, item["event"]["title"], inner))
+        pdf.cell(inner, 3.6, truncate(pdf, event_title(item["event"]), inner))
         cursor += 3.6
     if height >= 14:
         pdf.set_text_color(90, 98, 110)
@@ -839,17 +1174,14 @@ def paint_day(pdf: FPDF, font: str, day: datetime.date, events: list[dict], top:
     cursor = top + 9
 
     for item in allday:
-        if is_personal(item["event"]):
-            pdf.set_fill_color(255, 236, 204)
-            pdf.set_draw_color(176, 112, 32)
-        else:
-            pdf.set_fill_color(222, 234, 246)
-            pdf.set_draw_color(0, 83, 150)
+        fill, edge = schedule_colors(item["event"])
+        pdf.set_fill_color(*fill)
+        pdf.set_draw_color(*edge)
         pdf.rect(PAGE_MARGIN, cursor, PAGE_W - 2 * PAGE_MARGIN, 6, style="DF")
         pdf.set_text_color(28, 36, 48)
         pdf.set_font(font, "", 8)
         pdf.set_xy(PAGE_MARGIN + 2, cursor + 1.2)
-        chip = f"All day  {item['event']['title']}  ·  {friendly_place(item['event']['place'])}"
+        chip = f"All day  {event_title(item['event'])}  ·  {friendly_place(item['event']['place'])}"
         pdf.cell(PAGE_W - 2 * PAGE_MARGIN - 4, 4, truncate(pdf, chip, PAGE_W - 2 * PAGE_MARGIN - 6))
         cursor += 7
 
