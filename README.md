@@ -2,7 +2,16 @@
 
 Collects CERN seminars and, with an Indico API token, your own agenda for the next 7 days. It sends a Telegram message plus an hour-by-hour PDF. Without Telegram, it prints the digest and can also post it to a Mattermost or Slack webhook.
 
-Which series are collected is set in `notifier.py`. Optional local files are gitignored and are not part of the repository.
+The public series are set in `CATEGORIES` inside `notifier.py`.
+
+To follow particular people, add `PI_list.csv` next to `notifier.py`:
+
+```csv
+region,university,name
+EU,Example University,Ada Lovelace
+```
+
+If that person chairs a meeting, speaks, or is named in the agenda, the digest lists the meeting first under **PI this week**. The csv is gitignored. For the Sunday run, paste the whole file, header included, into a repository secret named `PI_LIST`.
 
 ## Setup
 
@@ -34,4 +43,4 @@ python notifier.py
 
 ## GitHub Actions
 
-`.github/workflows/weekly_events.yml` runs every Sunday at 07:00 UTC and can be started manually. GitHub may start it later the same day. Add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `INDICO_API_TOKEN` under **Settings → Secrets and variables → Actions**. Secret values are not shown in the repository.
+`.github/workflows/weekly_events.yml` runs every Sunday at 07:00 UTC and can be started manually. GitHub may start it later the same day. Add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `INDICO_API_TOKEN` under **Settings → Secrets and variables → Actions**. 
